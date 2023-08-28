@@ -20,9 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'turtle_node = turtle_control.turtle:main',
-            'random_walk_turtle = turtle_control.random_walk:main',
-            'follow_turtle = turtle_control.follow_turtle:main'
+            'turtle_node = turtle_control.turtle:main'
         ],
     },
 )

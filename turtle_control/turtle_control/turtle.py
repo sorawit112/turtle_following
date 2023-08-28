@@ -2,63 +2,32 @@ from typing import List, Optional
 import numpy as np
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
 from turtlesim_plus_interfaces.msg import ScannerData, ScannerDataArray
 from turtlesim.msg import Pose as TurtlePose
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
 
 from rcl_interfaces.msg import SetParametersResult, Parameter
 
-class ControlLaw():
-    k_lin = 1.0
-    k_ang = 2.8
-    control_freq = 10.0
-    goal_tolerance = 0.5
-    max_k_lin = 3.0
-    max_k_ang = 4.0
-    def __init__(self, k_lin=None, k_ang=None):
-        if k_lin:
-            self.k_lin = k_lin
-        if k_ang:
-            self.k_ang = k_ang
-    
-    def pose_diff(self, current_pose:TurtlePose, goal_pose:TurtlePose) -> np.array:
-        dx = goal_pose.x - current_pose.x
-        dy = goal_pose.y - current_pose.y
-        
-        return np.array([dx, dy])
-    
-    def theta_goal(self, current_pose:TurtlePose, goal_pose:TurtlePose):
-        diff = self.pose_diff(current_pose, goal_pose)        
-        
-        return np.arctan2(diff[1],diff[0])
-    
-    def go_to_pose(self, current_pose:TurtlePose, goal_pose:TurtlePose) -> Twist:
-        diff = self.pose_diff(current_pose, goal_pose)        
+from turtle_control.follow_turtle import FollowTurtle
+from turtle_control.random_walk import RandomWalk
 
-        err_dist = np.linalg.norm(diff)
-        err_theta = self.theta_goal(current_pose, goal_pose) - current_pose.theta
-        
-        cmd_vel = Twist()
-        cmd_vel.linear.x = self.k_lin*err_dist
-        cmd_vel.angular.z = self.k_ang*np.arctan2(np.sin(err_theta),np.cos(err_theta))
-        
-        return cmd_vel        
-    
-    def goal_checker(self, current_pose:TurtlePose, goal_pose:TurtlePose) -> bool:
-        diff = self.pose_diff(current_pose, goal_pose)        
-
-        return np.linalg.norm(diff) <= self.goal_tolerance
+from tf2_ros import TransformBroadcaster, Buffer, TransformListener
+from obo_ros_python_utils.custom_conversion import quaternion_from_euler
         
         
 class Turtle(Node):
     min_linear = 1.0
     max_linear = 3.0
-    def __init__(self, k_lin=None, k_ang=None):
+    max_k_lin = 3.0
+    max_k_ang = 10.0
+    min_angle = 0.3
+    
+    def __init__(self, k_lin=2.0, k_ang=2.0):
         super().__init__('node')
         self.cmd_vel_topic = "cmd_vel"
         self.scan_topic = "scan"
@@ -67,15 +36,16 @@ class Turtle(Node):
         self.declare_parameter('k_lin', k_lin)
         self.declare_parameter('k_ang', k_ang)
         
-        k_lin = self.get_parameter('k_lin').value
-        k_ang = self.get_parameter('k_ang').value
-        
         self.scanner_array:Optional[ScannerDataArray] = None
         self.current_pose:Optional[TurtlePose] = None
-        
-        self.control = ControlLaw(k_lin, k_ang)
-        
         self.subscriber_cb_group = ReentrantCallbackGroup()
+        self.service_server_cb_group = MutuallyExclusiveCallbackGroup()
+        self.timer_cb_group = ReentrantCallbackGroup()
+        
+        self.tf_pub = TransformBroadcaster(self, qos=1)
+        self.buffer = Buffer()
+        self.listener = TransformListener(self.buffer, self)
+        
         self.scan_sub = self.create_subscription(
                             ScannerDataArray, 
                             self.scan_topic,
@@ -92,15 +62,33 @@ class Turtle(Node):
                         )
         
         self.cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, qos_profile=1)
-        self.control_rate = self.create_rate(self.control.control_freq)
         
         self.add_on_set_parameters_callback(self.set_control_gain)
+        
+        self.follow_turtle = FollowTurtle(self)
+        self.random_walk = RandomWalk(self)
          
     def scan_cb(self, msg:ScannerDataArray):
         self.scanner_array = msg.data
     
     def pose_cb(self, msg:TurtlePose):
         self.current_pose = msg
+        self.publish_tf(msg)
+    
+    def publish_tf(self, msg:TurtlePose):
+        tf_stamped = TransformStamped()
+        tf_stamped.header.frame_id = 'world'
+        tf_stamped.header.stamp = self.get_clock().now().to_msg()
+        tf_stamped.child_frame_id = self.get_namespace()+'/pose'
+        tf_stamped.transform.translation.x = msg.x
+        tf_stamped.transform.translation.y = msg.y
+        qx,qy,qz,qw = quaternion_from_euler(0., 0., msg.theta)
+        tf_stamped.transform.rotation.x = qx
+        tf_stamped.transform.rotation.y = qy
+        tf_stamped.transform.rotation.z = qz
+        tf_stamped.transform.rotation.w = qw
+        
+        self.tf_pub.sendTransform(tf_stamped)
         
     def scan_around(self):
         cmd_vel = Twist()
@@ -113,16 +101,18 @@ class Turtle(Node):
         for param in params:
             if param.name == 'k_lin':
                 if param.value >= 0:
-                    if param.value > self.control.max_k_lin:
+                    if param.value > self.max_k_lin:
                         self.get_logger().warn(f'{param.value} greater than max_k_lin -> set to max_k_lin')
-                    self.control.k_lin = min(param.value, self.control.max_k_lin)
+                    self.follow_turtle.set_linear_gain(min(param.value, self.max_k_lin))
+                    self.random_walk.set_linear_gain(min(param.value, self.max_k_lin))
                 else:
                     self.get_logger().warn('k_lin value is negative -> skipping')
             elif param.name == 'k_ang':
                 if param.value >= 0:
-                    if param.value > self.control.max_k_ang:
+                    if param.value > self.max_k_ang:
                         self.get_logger().warn(f'{param.value} greater than max_k_ang -> set to max_k_ang')
-                    self.control.k_ang = min(param.value, self.control.max_k_ang)
+                    self.follow_turtle.set_angular_gain(min(param.value, self.max_k_ang))
+                    self.random_walk.set_angular_gain(min(param.value, self.max_k_ang))
                 else:
                     self.get_logger().warn('k_ang value is negative -> skipping')
             else:
@@ -139,7 +129,7 @@ class Turtle(Node):
     def clamped_vel(self, cmd_vel:Twist) -> Twist:
         clamped_cmd_vel = Twist()
         clamped_cmd_vel.linear.x = min(max(cmd_vel.linear.x, self.min_linear), self.max_linear)
-        clamped_cmd_vel.angular.z = cmd_vel.angular.z
+        clamped_cmd_vel.angular.z = max(abs(cmd_vel.angular.z), self.min_angle) * np.sign(cmd_vel.angular.z)
         
         return clamped_cmd_vel
         
@@ -150,7 +140,8 @@ def main(args=None):
     
     try:
         rclpy.spin(turtle)
-    except:
+    except Exception as e:
+        print(e)
         turtle.destroy_node()
     finally:
         try:
